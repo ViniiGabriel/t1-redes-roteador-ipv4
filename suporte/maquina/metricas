@@ -1,0 +1,33 @@
+#!/usr/bin/env python3
+"""metricas ENDERECO [CAMINHO] [METODO]
+
+Faz uma requisição HTTP sobre UDP à porta 9100 do roteador, com até 3 tentativas
+de 1 s, e mostra a resposta. Sem resposta, termina com código 1.
+"""
+import socket
+import sys
+
+if len(sys.argv) < 2 or len(sys.argv) > 4:
+    print("uso: metricas ENDERECO [CAMINHO] [METODO]", file=sys.stderr)
+    sys.exit(2)
+
+endereco = sys.argv[1]
+caminho = sys.argv[2] if len(sys.argv) > 2 else "/metrics"
+metodo = sys.argv[3] if len(sys.argv) > 3 else "GET"
+requisicao = f"{metodo} {caminho} HTTP/1.1\r\nHost: {endereco}:9100\r\n\r\n".encode()
+
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(1.0)
+for tentativa in range(1, 4):
+    s.sendto(requisicao, (endereco, 9100))
+    try:
+        resposta, _ = s.recvfrom(65535)
+    except socket.timeout:
+        print(f"tentativa {tentativa}: sem resposta em 1 s", file=sys.stderr)
+        continue
+    sys.stdout.write(resposta.decode("utf-8", "replace"))
+    sys.stdout.flush()
+    sys.exit(0)
+
+print(f"{endereco}: nenhuma resposta em 3 tentativas", file=sys.stderr)
+sys.exit(1)

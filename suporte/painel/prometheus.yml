@@ -1,0 +1,19 @@
+# Coleta as métricas de r1, r2 e r3 pela ponte do gerente a cada 5 s.
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+scrape_configs:
+  - job_name: roteadores
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["192.168.100.1"]
+        labels: {roteador: r1}
+      - targets: ["192.168.100.2"]
+        labels: {roteador: r2}
+      - targets: ["192.168.100.3"]
+        labels: {roteador: r3}
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_alvo
+      - target_label: __address__
+        replacement: 10.199.199.100:9101

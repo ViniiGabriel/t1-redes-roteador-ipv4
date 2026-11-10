@@ -1,0 +1,220 @@
+# Trabalho prático de DEC7557: topologia com o roteador do grupo.
+# Requer Docker Engine 28 ou mais recente e Docker Compose 2.36 ou mais recente.
+# Endereços e endereços físicos: seção 1 da especificação.
+name: tp-roteador
+
+x-maquina: &maquina
+  build: ./suporte/maquina
+  image: tp-roteador-maquina:1
+  init: true
+  depends_on: [isolamento]
+  cap_add: [NET_ADMIN, NET_RAW]
+  sysctls:
+    net.ipv6.conf.all.disable_ipv6: "1"
+    net.ipv6.conf.default.disable_ipv6: "1"
+  volumes:
+    - ./quadros:/quadros:ro
+    - ./capturas:/capturas
+
+x-roteador: &roteador
+  build: ./roteador
+  image: tp-roteador-roteador:1
+  init: true
+  depends_on: [isolamento]
+  cap_add: [NET_ADMIN, NET_RAW]
+  sysctls:
+    net.ipv4.ip_forward: "0"
+    net.ipv6.conf.all.disable_ipv6: "1"
+    net.ipv6.conf.default.disable_ipv6: "1"
+  entrypoint: ["sh", "/suporte/iniciar.sh"]
+  volumes:
+    - ./roteador:/fonte/roteador:ro
+    - ./configuracao:/configuracao:ro
+    - ./capturas:/capturas
+    - ./suporte/roteador/iniciar.sh:/suporte/iniciar.sh:ro
+    - estado:/estado:ro
+
+services:
+  # Desliga o IPv6 do hospedeiro nas pontes da topologia (ver suporte/isolamento/isolar.sh).
+  isolamento:
+    build: ./suporte/maquina
+    image: tp-roteador-maquina:1
+    container_name: tp-isolamento
+    init: true
+    privileged: true
+    network_mode: host
+    command: ["sh", "/suporte/isolar.sh"]
+    volumes:
+      - ./suporte/isolamento/isolar.sh:/suporte/isolar.sh:ro
+
+  h1:
+    <<: *maquina
+    container_name: h1
+    hostname: h1
+    environment:
+      GATEWAY: 10.0.1.1
+    networks:
+      enlace-h1-r1: {interface_name: eth0, ipv4_address: 10.0.1.10, mac_address: "02:00:00:00:0a:01"}
+
+  r1:
+    <<: *roteador
+    container_name: r1
+    hostname: r1
+    environment:
+      NOME: r1
+    networks:
+      enlace-h1-r1: {interface_name: eth0, ipv4_address: 10.0.1.1, mac_address: "02:00:00:00:01:00"}
+      enlace-r1-r2: {interface_name: eth1, ipv4_address: 10.0.12.1, mac_address: "02:00:00:00:01:01"}
+      gerencia: {interface_name: mgmt0, ipv4_address: 192.168.100.1, mac_address: "02:00:00:00:01:ff"}
+
+  r2:
+    <<: *roteador
+    container_name: r2
+    hostname: r2
+    environment:
+      NOME: r2
+    networks:
+      enlace-r1-r2: {interface_name: eth0, ipv4_address: 10.0.12.2, mac_address: "02:00:00:00:02:00"}
+      enlace-r2-r3: {interface_name: eth1, ipv4_address: 10.0.23.2, mac_address: "02:00:00:00:02:01"}
+      gerencia: {interface_name: mgmt0, ipv4_address: 192.168.100.2, mac_address: "02:00:00:00:02:ff"}
+
+  r3:
+    <<: *roteador
+    container_name: r3
+    hostname: r3
+    environment:
+      NOME: r3
+    networks:
+      enlace-r2-r3: {interface_name: eth0, ipv4_address: 10.0.23.3, mac_address: "02:00:00:00:03:00"}
+      enlace-r3-h2: {interface_name: eth1, ipv4_address: 10.0.4.1, mac_address: "02:00:00:00:03:01"}
+      gerencia: {interface_name: mgmt0, ipv4_address: 192.168.100.3, mac_address: "02:00:00:00:03:ff"}
+
+  h2:
+    <<: *maquina
+    container_name: h2
+    hostname: h2
+    environment:
+      GATEWAY: 10.0.4.1
+    networks:
+      enlace-r3-h2: {interface_name: eth0, ipv4_address: 10.0.4.10, mac_address: "02:00:00:00:0a:02"}
+
+  gerente:
+    <<: *maquina
+    container_name: gerente
+    hostname: gerente
+    networks:
+      gerencia: {interface_name: eth0, ipv4_address: 192.168.100.100, mac_address: "02:00:00:00:0a:64"}
+      # Usada só pela ponte do perfil painel; não faz parte da topologia.
+      painel: {interface_name: painel0, ipv4_address: 10.199.199.100}
+
+  # docker compose run --rm testes
+  testes:
+    build: ./suporte/ferramentas
+    image: tp-roteador-ferramentas:1
+    profiles: [ferramentas]
+    network_mode: none
+    depends_on: [h1, r1, r2, r3, h2, gerente]
+    entrypoint: ["python3", "/suporte/testes.py"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./suporte/ferramentas:/suporte:ro
+      - estado:/estado
+
+  # docker compose run --rm falha CENARIO
+  falha:
+    build: ./suporte/ferramentas
+    image: tp-roteador-ferramentas:1
+    profiles: [ferramentas]
+    network_mode: none
+    depends_on: [h1, r1, r2, r3, h2, gerente]
+    entrypoint: ["python3", "/suporte/falha.py"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./suporte/ferramentas:/suporte:ro
+      - estado:/estado
+
+  # docker compose --profile painel up -d
+  ponte:
+    build: ./suporte/maquina
+    image: tp-roteador-maquina:1
+    profiles: [painel]
+    network_mode: "service:gerente"
+    depends_on: [gerente]
+    init: true
+    command: ["python3", "/suporte/ponte.py"]
+    volumes:
+      - ./suporte/painel/ponte.py:/suporte/ponte.py:ro
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    profiles: [painel]
+    depends_on: [ponte]
+    volumes:
+      - ./suporte/painel/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      painel: {ipv4_address: 10.199.199.10}
+
+  grafana:
+    image: grafana/grafana:12.1.1
+    profiles: [painel]
+    depends_on: [prometheus]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/provisioning/dashboards/roteadores.json
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./suporte/painel/grafana:/etc/grafana/provisioning:ro
+    networks:
+      painel: {ipv4_address: 10.199.199.20}
+
+volumes:
+  estado:
+
+# Cada enlace é uma ponte do Docker sem endereço IPv4 no hospedeiro (inhibit_ipv4)
+# e com nome fixo, que o serviço isolamento reconhece.
+x-enlace: &enlace
+  driver: bridge
+  enable_ipv6: false
+
+networks:
+  enlace-h1-r1:
+    <<: *enlace
+    driver_opts:
+      com.docker.network.bridge.name: tpr-h1-r1
+      com.docker.network.bridge.inhibit_ipv4: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+    ipam: {config: [{subnet: 10.0.1.0/24, gateway: 10.0.1.254}]}
+  enlace-r1-r2:
+    <<: *enlace
+    driver_opts:
+      com.docker.network.bridge.name: tpr-r1-r2
+      com.docker.network.bridge.inhibit_ipv4: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+    ipam: {config: [{subnet: 10.0.12.0/24, gateway: 10.0.12.254}]}
+  enlace-r2-r3:
+    <<: *enlace
+    driver_opts:
+      com.docker.network.bridge.name: tpr-r2-r3
+      com.docker.network.bridge.inhibit_ipv4: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+    ipam: {config: [{subnet: 10.0.23.0/24, gateway: 10.0.23.254}]}
+  enlace-r3-h2:
+    <<: *enlace
+    driver_opts:
+      com.docker.network.bridge.name: tpr-r3-h2
+      com.docker.network.bridge.inhibit_ipv4: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+    ipam: {config: [{subnet: 10.0.4.0/24, gateway: 10.0.4.254}]}
+  gerencia:
+    <<: *enlace
+    driver_opts:
+      com.docker.network.bridge.name: tpr-gerencia
+      com.docker.network.bridge.inhibit_ipv4: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+    ipam: {config: [{subnet: 192.168.100.0/24, gateway: 192.168.100.254}]}
+  painel:
+    driver: bridge
+    ipam: {config: [{subnet: 10.199.199.0/24}]}
