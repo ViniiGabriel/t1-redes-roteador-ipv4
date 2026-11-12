@@ -1,81 +1,71 @@
 #!/usr/bin/env python3
 import socket
 import struct
+import ipaddress
 from protocolos import (
     BROADCAST_MAC,
-    criar_quadro_eth,
+    enviar_quadro,
     validar_ipv4,
+    validar_udp_local,
     decrementar_ttl,
     criar_icmp_erro,
     criar_echo_reply,
+    criar_pacote_udp,
+    processar_http_udp,
     pode_gerar_erro_icmp
 )
-from registro import registrar_descarte
+from registro import registrar_descarte, inc_metrica
 
 
 def construir_tabela_rotas(config: dict) -> list:
     rotas = []
-    # 1. Redes conectadas (interfaces exceto gerência)
+    # 1. Redes conectadas (interfaces de dados)
     for nome_if, iface in config["interfaces"].items():
-        if iface.get("gerencia", False):
+        if iface["gerencia"]:
             continue
-        mask = (0xFFFFFFFF << (32 - iface["prefixo"])) & 0xFFFFFFFF if iface["prefixo"] > 0 else 0
-        ip_int = struct.unpack("!I", iface["ip_bytes"])[0]
-        rede_int = ip_int & mask
+        rede = ipaddress.ip_network(f"{iface['ip']}/{iface['prefixo']}", strict=False)
         rotas.append({
-            "rede": rede_int,
-            "prefixo": iface["prefixo"],
+            "rede": rede,
             "via": None,
             "interface": nome_if,
             "conectada": True
         })
 
     # 2. Rotas estáticas
-    for r in config.get("rotas", []):
-        pref_str, len_str = r["prefixo"].split('/')
-        pref_len = int(len_str)
-        mask = (0xFFFFFFFF << (32 - pref_len)) & 0xFFFFFFFF if pref_len > 0 else 0
-        rede_int = struct.unpack("!I", socket.inet_aton(pref_str))[0] & mask
+    for r in config["rotas"]:
+        rede_dest = ipaddress.ip_network(r["prefixo"], strict=False)
+        ip_via = ipaddress.ip_address(r["via"])
 
-        via_str = r["via"]
-        via_int = struct.unpack("!I", socket.inet_aton(via_str))[0]
-
-        # Encontra a interface da rede conectada que contém o próximo salto
-        out_if = None
+        # Descobre qual interface conectada contém o próximo salto (via)
         for cr in rotas:
-            if cr["conectada"]:
-                cmask = (0xFFFFFFFF << (32 - cr["prefixo"])) & 0xFFFFFFFF if cr["prefixo"] > 0 else 0
-                if (via_int & cmask) == cr["rede"]:
-                    out_if = cr["interface"]
-                    break
-
-        if out_if is not None:
-            rotas.append({
-                "rede": rede_int,
-                "prefixo": pref_len,
-                "via": via_str,
-                "interface": out_if,
-                "conectada": False
-            })
+            if cr["conectada"] and ip_via in cr["rede"]:
+                rotas.append({
+                    "rede": rede_dest,
+                    "via": r["via"],
+                    "interface": cr["interface"],
+                    "conectada": False
+                })
+                break
 
     return rotas
 
 
 def buscar_rota(tabela_rotas: list, dest_ip_str: str):
-    dest_int = struct.unpack("!I", socket.inet_aton(dest_ip_str))[0]
+    ip_dest = ipaddress.ip_address(dest_ip_str)
     melhor = None
+
     for r in tabela_rotas:
-        mask = (0xFFFFFFFF << (32 - r["prefixo"])) & 0xFFFFFFFF if r["prefixo"] > 0 else 0
-        if (dest_int & mask) == r["rede"]:
+        if ip_dest in r["rede"]:
             if melhor is None:
                 melhor = r
-            elif r["prefixo"] > melhor["prefixo"]:
+            elif r["rede"].prefixlen > melhor["rede"].prefixlen:
                 melhor = r
-            elif r["prefixo"] == melhor["prefixo"] and r["conectada"] and not melhor["conectada"]:
+            elif r["rede"].prefixlen == melhor["rede"].prefixlen and r["conectada"] and not melhor["conectada"]:
                 melhor = r
 
     if melhor is None:
         return None
+
     prox_salto = melhor["via"] if melhor["via"] is not None else dest_ip_str
     return melhor["interface"], prox_salto
 
@@ -85,18 +75,31 @@ def enviar_ip(pacote_ip: bytes, out_if_name: str, proximo_salto: str, config: di
     out_if = config["interfaces"][out_if_name]
     mac_dst = tabela_arp.obter_mac(proximo_salto)
     if mac_dst is not None:
-        quadro = criar_quadro_eth(mac_dst, out_if["mac_bytes"], 0x0800, pacote_ip)
-        out_if["sock"].send(quadro)
+        enviar_quadro(out_if, mac_dst, 0x0800, pacote_ip)
     else:
         tabela_arp.enfileirar(
-            proximo_salto,
-            out_if_name,
-            pacote_ip,
-            gerado_localmente,
-            pacote_original,
-            in_if_name,
-            config
+            proximo_salto, out_if_name, pacote_ip,
+            gerado_localmente, pacote_original, in_if_name, config
         )
+
+
+def enviar_pacote_gerado(pacote_ip: bytes, in_if_name: str, config: dict, tabela_rotas: list, tabela_arp):
+    """Envia pacotes criados pelo próprio roteador (Echo Reply, erros ICMP, respostas UDP)."""
+    origem_str = socket.inet_ntoa(pacote_ip[12:16])
+    destino_str = socket.inet_ntoa(pacote_ip[16:20])
+    proto = pacote_ip[9]
+
+    # Se responde a pacote que chegou pela gerência, sai direto por ela sem consultar rotas (Seção 6)
+    if config["interfaces"][in_if_name]["gerencia"]:
+        enviar_ip(pacote_ip, in_if_name, destino_str, config, tabela_arp, gerado_localmente=True)
+        return
+
+    rota = buscar_rota(tabela_rotas, destino_str)
+    if rota is not None:
+        out_if_name, prox = rota
+        enviar_ip(pacote_ip, out_if_name, prox, config, tabela_arp, gerado_localmente=True)
+    else:
+        registrar_descarte("sem_rota", origem_str, destino_str, proto)
 
 
 def tratar_falha_arp_icmp(pacote_original: bytes, in_if_name: str, config: dict, tabela_rotas: list, tabela_arp):
@@ -104,24 +107,48 @@ def tratar_falha_arp_icmp(pacote_original: bytes, in_if_name: str, config: dict,
         return
     ip_origem_icmp = config["interfaces"][in_if_name]["ip"]
     icmp_erro = criar_icmp_erro(3, 1, pacote_original, ip_origem_icmp)
-    origem_original_str = socket.inet_ntoa(pacote_original[12:16])
+    enviar_pacote_gerado(icmp_erro, in_if_name, config, tabela_rotas, tabela_arp)
 
-    if config["interfaces"][in_if_name]["gerencia"]:
-        enviar_ip(icmp_erro, in_if_name, origem_original_str, config, tabela_arp, gerado_localmente=True)
-    else:
-        rota = buscar_rota(tabela_rotas, origem_original_str)
-        if rota is not None:
-            out_if_name, prox = rota
-            enviar_ip(icmp_erro, out_if_name, prox, config, tabela_arp, gerado_localmente=True)
-        else:
-            registrar_descarte("sem_rota", ip_origem_icmp, origem_original_str, 1)
+
+def verificar_filtros(pacote_ip: bytes, filtros: list):
+    """Retorna ('permitir', None) ou ('negar', indice_regra) conforme Seção 11."""
+    ihl = (pacote_ip[0] & 0x0F) * 4
+    proto_num = pacote_ip[9]
+    ip_orig = ipaddress.ip_address(socket.inet_ntoa(pacote_ip[12:16]))
+    ip_dest = ipaddress.ip_address(socket.inet_ntoa(pacote_ip[16:20]))
+
+    flags_desloc = struct.unpack("!H", pacote_ip[6:8])[0]
+    eh_fragmento_posterior = (flags_desloc & 0x1FFF) != 0
+    dados_transporte = pacote_ip[ihl:]
+
+    for idx, regra in enumerate(filtros, start=1):
+        if regra["protocolo"] == "icmp" and proto_num != 1:
+            continue
+        if regra["protocolo"] == "udp" and proto_num != 17:
+            continue
+
+        if regra["origem"] != "*" and ip_orig not in ipaddress.ip_network(regra["origem"], strict=False):
+            continue
+        if regra["destino"] != "*" and ip_dest not in ipaddress.ip_network(regra["destino"], strict=False):
+            continue
+
+        if regra["porta"] != "*":
+            if proto_num != 17 or eh_fragmento_posterior or len(dados_transporte) < 4:
+                continue
+            porta_dst = struct.unpack("!H", dados_transporte[2:4])[0]
+            if porta_dst != int(regra["porta"]):
+                continue
+
+        return regra["acao"], idx
+
+    return "permitir", None
 
 
 def processar_ipv4(quadro: bytes, in_if_name: str, config: dict, tabela_rotas: list, tabela_arp):
-    dados_ip = quadro[14:]
-    pacote_ip = validar_ipv4(dados_ip)
+    # Passo 1: Validação
+    pacote_ip = validar_ipv4(quadro[14:])
     if pacote_ip is None:
-        # Descarte motivo cabecalho (sem registro na saída padrão)
+        registrar_descarte("cabecalho")
         return
 
     origem_ip = socket.inet_ntoa(pacote_ip[12:16])
@@ -131,7 +158,7 @@ def processar_ipv4(quadro: bytes, in_if_name: str, config: dict, tabela_rotas: l
     chegou_em_broadcast = (quadro[:6] == BROADCAST_MAC)
 
     # Passo 2: Broadcast e Multicast
-    if dest_ip == "255.255.255.255" or (pacote_ip[16] >= 224 and pacote_ip[16] <= 239):
+    if dest_ip == "255.255.255.255" or (224 <= pacote_ip[16] <= 239):
         registrar_descarte("local", origem_ip, dest_ip, proto)
         return
 
@@ -140,60 +167,72 @@ def processar_ipv4(quadro: bytes, in_if_name: str, config: dict, tabela_rotas: l
             registrar_descarte("local", origem_ip, dest_ip, proto)
             return
 
-    # Passo 3: Entrega local
+    # Passo 3: Entrega local (Seção 8)
     ips_locais = {info["ip"]: info for info in config["interfaces"].values()}
     if dest_ip in ips_locais:
         dst_if = ips_locais[dest_ip]
         in_if = config["interfaces"][in_if_name]
+        ihl = (pacote_ip[0] & 0x0F) * 4
 
-        # Descarte se gerencia -> dados ou dados -> gerencia
-        if dst_if["gerencia"] and not in_if["gerencia"]:
-            registrar_descarte("local", origem_ip, dest_ip, proto)
-            return
-        if not dst_if["gerencia"] and in_if["gerencia"]:
-            registrar_descarte("local", origem_ip, dest_ip, proto)
-            return
-
-        # ICMP echo request
+        # Antes da tabela: valida cabeçalho ICMP ou UDP (Seção 8)
         if proto == 1:
-            reply = criar_echo_reply(pacote_ip, dest_ip)
-            if reply is None:
-                return  # Falha de validação ICMP (descarte cabecalho)
+            dados_icmp = pacote_ip[ihl:]
+            if len(dados_icmp) < 8:
+                registrar_descarte("cabecalho")
+                return
+            if dados_icmp[0] == 8 and dados_icmp[1] == 0:
+                from protocolos import checksum
+                if checksum(dados_icmp) != 0:
+                    registrar_descarte("cabecalho")
+                    return
+        elif proto == 17:
+            info_udp = validar_udp_local(pacote_ip)
+            if info_udp is None:
+                registrar_descarte("cabecalho")
+                return
 
-            if in_if["gerencia"]:
-                enviar_ip(reply, in_if_name, origem_ip, config, tabela_arp, gerado_localmente=True)
-            else:
-                rota = buscar_rota(tabela_rotas, origem_ip)
-                if rota is not None:
-                    out_if_name, prox = rota
-                    enviar_ip(reply, out_if_name, prox, config, tabela_arp, gerado_localmente=True)
-                else:
-                    registrar_descarte("sem_rota", dest_ip, origem_ip, 1)
+        # Linha 1 da tabela: cruzamento entre dados e gerência
+        if dst_if["gerencia"] != in_if["gerencia"]:
+            registrar_descarte("local", origem_ip, dest_ip, proto)
             return
 
-        # UDP (porta sem serviço gera 3/3 e descarte local)
+        # Linha 2 da tabela: ICMP Echo Request (8/0)
+        if proto == 1 and pacote_ip[ihl] == 8 and pacote_ip[ihl + 1] == 0:
+            res_icmp = criar_echo_reply(pacote_ip, dest_ip)
+            enviar_pacote_gerado(res_icmp, in_if_name, config, tabela_rotas, tabela_arp)
+            return
+
+        # Linhas 3 e 4 da tabela: UDP
         if proto == 17:
+            porta_orig, porta_dst, dados_app = info_udp
+            if dst_if["gerencia"] and porta_dst == 9100:
+                corpo_http = processar_http_udp(
+                    dados_app,
+                    tabela_arp.total_entradas(),
+                    tabela_arp.total_pendentes()
+                )
+                pkt_resp = criar_pacote_udp(dest_ip, 9100, origem_ip, porta_orig, corpo_http)
+                enviar_pacote_gerado(pkt_resp, in_if_name, config, tabela_rotas, tabela_arp)
+                return
+
             registrar_descarte("local", origem_ip, dest_ip, proto)
             if pode_gerar_erro_icmp(pacote_ip, chegou_em_broadcast, config["interfaces"]):
                 icmp_erro = criar_icmp_erro(3, 3, pacote_ip, dest_ip)
-                if in_if["gerencia"]:
-                    enviar_ip(icmp_erro, in_if_name, origem_ip, config, tabela_arp, gerado_localmente=True)
-                else:
-                    rota = buscar_rota(tabela_rotas, origem_ip)
-                    if rota is not None:
-                        out_if_name, prox = rota
-                        enviar_ip(icmp_erro, out_if_name, prox, config, tabela_arp, gerado_localmente=True)
-                    else:
-                        registrar_descarte("sem_rota", dest_ip, origem_ip, 1)
+                enviar_pacote_gerado(icmp_erro, in_if_name, config, tabela_rotas, tabela_arp)
             return
 
-        # Outros protocolos
+        # Linha 5 da tabela: ICMP de outro tipo ou qualquer outro protocolo
         registrar_descarte("local", origem_ip, dest_ip, proto)
         return
 
-    # Passo 4: Filtragem e pacotes em mgmt0
+    # Passo 4: Filtragem (Seção 11) e bloqueio de trânsito na gerência
     if config["interfaces"][in_if_name]["gerencia"]:
         registrar_descarte("local", origem_ip, dest_ip, proto)
+        return
+
+    acao, num_regra = verificar_filtros(pacote_ip, config["filtros"])
+    if acao == "negar":
+        registrar_descarte("filtro", origem_ip, dest_ip, proto, regra=num_regra)
         return
 
     # Passo 5: TTL
@@ -202,12 +241,7 @@ def processar_ipv4(quadro: bytes, in_if_name: str, config: dict, tabela_rotas: l
         if pode_gerar_erro_icmp(pacote_ip, chegou_em_broadcast, config["interfaces"]):
             ip_origem_icmp = config["interfaces"][in_if_name]["ip"]
             icmp_erro = criar_icmp_erro(11, 0, pacote_ip, ip_origem_icmp)
-            rota = buscar_rota(tabela_rotas, origem_ip)
-            if rota is not None:
-                out_if_name, prox = rota
-                enviar_ip(icmp_erro, out_if_name, prox, config, tabela_arp, gerado_localmente=True)
-            else:
-                registrar_descarte("sem_rota", ip_origem_icmp, origem_ip, 1)
+            enviar_pacote_gerado(icmp_erro, in_if_name, config, tabela_rotas, tabela_arp)
         return
 
     # Passo 6: Rota
@@ -217,25 +251,15 @@ def processar_ipv4(quadro: bytes, in_if_name: str, config: dict, tabela_rotas: l
         if pode_gerar_erro_icmp(pacote_ip, chegou_em_broadcast, config["interfaces"]):
             ip_origem_icmp = config["interfaces"][in_if_name]["ip"]
             icmp_erro = criar_icmp_erro(3, 0, pacote_ip, ip_origem_icmp)
-            rota_volta = buscar_rota(tabela_rotas, origem_ip)
-            if rota_volta is not None:
-                out_if_name, prox = rota_volta
-                enviar_ip(icmp_erro, out_if_name, prox, config, tabela_arp, gerado_localmente=True)
-            else:
-                registrar_descarte("sem_rota", ip_origem_icmp, origem_ip, 1)
+            enviar_pacote_gerado(icmp_erro, in_if_name, config, tabela_rotas, tabela_arp)
         return
 
-    out_if_name, prox_salto = rota
-
     # Passo 7: Encaminhamento
+    out_if_name, prox_salto = rota
+    inc_metrica("pacotes_encaminhados")
     pacote_encaminhado = decrementar_ttl(pacote_ip)
     enviar_ip(
-        pacote_encaminhado,
-        out_if_name,
-        prox_salto,
-        config,
-        tabela_arp,
-        gerado_localmente=False,
-        pacote_original=pacote_ip,
-        in_if_name=in_if_name
+        pacote_encaminhado, out_if_name, prox_salto,
+        config, tabela_arp, gerado_localmente=False,
+        pacote_original=pacote_ip, in_if_name=in_if_name
     )

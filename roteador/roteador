@@ -5,14 +5,10 @@ import select
 import socket
 import struct
 from config import ler_configuracao
-from registro import registrar_inicio
+from registro import registrar_inicio, registrar_descarte, inc_metrica
 from protocolos import BROADCAST_MAC
 from arp import TabelaARP
 from roteamento import construir_tabela_rotas, processar_ipv4, tratar_falha_arp_icmp
-
-SOL_PACKET = 263
-PACKET_ADD_MEMBERSHIP = 1
-PACKET_MR_PROMISC = 1
 
 
 def main():
@@ -25,23 +21,15 @@ def main():
 
     config = ler_configuracao(sys.argv[1])
 
-    # 1. Abre sockets AF_PACKET para cada interface
     socket_para_if = {}
     for nome_if, dados_if in config["interfaces"].items():
         s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
         s.bind((nome_if, 0))
-        try:
-            idx = socket.if_nametoindex(nome_if)
-            s.setsockopt(SOL_PACKET, PACKET_ADD_MEMBERSHIP, struct.pack("iHH8s", idx, PACKET_MR_PROMISC, 0, b""))
-        except Exception:
-            pass
         dados_if["sock"] = s
         socket_para_if[s] = nome_if
 
-    # 2. Emite registro de início
     registrar_inicio(config["nome"])
 
-    # 3. Inicializa tabelas
     tabela_arp = TabelaARP()
     tabela_rotas = construir_tabela_rotas(config)
     lista_sockets = list(socket_para_if.keys())
@@ -50,31 +38,36 @@ def main():
         tratar_falha_arp_icmp(pacote_original, in_if_name, config, tabela_rotas, tabela_arp)
 
     while True:
-        # Espera atividade nos sockets por até 0.05s
         prontos, _, _ = select.select(lista_sockets, [], [], 0.05)
 
         for s in prontos:
             quadro, addr = s.recvfrom(65535)
 
-            # Ignora quadros enviados pelo próprio roteador ou curtos demais
-            if addr[2] == 4 or len(quadro) < 14:
+            # Ignora quadros enviados pelo próprio roteador (PACKET_OUTGOING == 4)
+            if addr[2] == 4:
                 continue
 
             in_if_name = socket_para_if[s]
             in_if = config["interfaces"][in_if_name]
+            inc_metrica(f"quadros_recebidos_{in_if_name}")
+
+            if len(quadro) < 14:
+                registrar_descarte("quadro")
+                continue
 
             mac_dst, mac_src, ethertype = struct.unpack('!6s6sH', quadro[:14])
 
-            # Só aceita se o destino for o MAC da interface ou broadcast
             if mac_dst != in_if["mac_bytes"] and mac_dst != BROADCAST_MAC:
+                registrar_descarte("quadro")
                 continue
 
             if ethertype == 0x0806:
                 tabela_arp.tratar_quadro_arp(quadro, in_if_name, config)
             elif ethertype == 0x0800:
                 processar_ipv4(quadro, in_if_name, config, tabela_rotas, tabela_arp)
+            else:
+                registrar_descarte("quadro")
 
-        # Atualiza temporizadores do ARP (expiração do cache e retentativas/falha de resolução)
         tabela_arp.verificar_temporizadores(config, callback_falha_arp)
 
 

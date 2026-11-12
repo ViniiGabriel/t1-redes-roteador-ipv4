@@ -2,7 +2,7 @@
 import socket
 import struct
 import time
-from protocolos import BROADCAST_MAC, criar_quadro_eth
+from protocolos import BROADCAST_MAC, enviar_quadro
 from registro import (
     registrar_arp_aprendido,
     registrar_arp_expirado,
@@ -13,10 +13,14 @@ from registro import (
 
 class TabelaARP:
     def __init__(self):
-        # ip_str -> {"mac": bytes, "tempo": float}
         self.cache = {}
-        # ip_str -> {"interface": str, "criacao": float, "tentativas": int, "fila": list}
         self.pendentes = {}
+
+    def total_entradas(self) -> int:
+        return len(self.cache)
+
+    def total_pendentes(self) -> int:
+        return sum(len(p["fila"]) for p in self.pendentes.values())
 
     def obter_mac(self, ip_str: str):
         if ip_str in self.cache:
@@ -31,8 +35,7 @@ class TabelaARP:
             iface["mac_bytes"], iface["ip_bytes"],
             b"\x00" * 6, socket.inet_aton(proximo_salto)
         )
-        quadro = criar_quadro_eth(BROADCAST_MAC, iface["mac_bytes"], 0x0806, arp_req)
-        iface["sock"].send(quadro)
+        enviar_quadro(iface, BROADCAST_MAC, 0x0806, arp_req)
 
     def enfileirar(self, proximo_salto: str, out_if_name: str, pacote_ip: bytes,
                    gerado_localmente: bool, pacote_original: bytes, in_if_name: str, config: dict):
@@ -48,7 +51,6 @@ class TabelaARP:
 
         pend = self.pendentes[proximo_salto]
         if len(pend["fila"]) >= 16:
-            # Fila cheia: descarte fila_arp sem ICMP
             origem_str = socket.inet_ntoa(pacote_ip[12:16])
             destino_str = socket.inet_ntoa(pacote_ip[16:20])
             proto = pacote_ip[9]
@@ -65,23 +67,16 @@ class TabelaARP:
     def tratar_quadro_arp(self, quadro: bytes, in_if_name: str, config: dict):
         dados_arp = quadro[14:]
         if len(dados_arp) < 28:
+            registrar_descarte("quadro")
             return
 
         (
-            tipo_hardware,
-            tipo_protocolo,
-            tam_mac,
-            tam_ip,
-            operacao,
-            mac_remetente,
-            ip_remetente,
-            mac_alvo,
-            ip_alvo
+            tipo_hardware, tipo_protocolo, tam_mac, tam_ip, operacao,
+            mac_remetente, ip_remetente, mac_alvo, ip_alvo
         ) = struct.unpack('!HHBBH6s4s6s4s', dados_arp[:28])
 
-        if (tipo_hardware, tipo_protocolo, tam_mac, tam_ip) != (1, 0x0800, 6, 4):
-            return
-        if operacao not in (1, 2):
+        if (tipo_hardware, tipo_protocolo, tam_mac, tam_ip) != (1, 0x0800, 6, 4) or operacao not in (1, 2):
+            registrar_descarte("quadro")
             return
 
         in_if = config["interfaces"][in_if_name]
@@ -96,16 +91,12 @@ class TabelaARP:
 
         registrar_arp_aprendido(ip_remetente_str, mac_remetente.hex(":"), in_if_name)
 
-        # Se havia pacotes esperando este endereço, envia todos eles
         if ip_remetente_str in self.pendentes:
             pend = self.pendentes.pop(ip_remetente_str)
             out_if = config["interfaces"][pend["interface"]]
             for item in pend["fila"]:
-                pacote_ip = item["pacote_ip"]
-                quadro_ip = criar_quadro_eth(mac_remetente, out_if["mac_bytes"], 0x0800, pacote_ip)
-                out_if["sock"].send(quadro_ip)
+                enviar_quadro(out_if, mac_remetente, 0x0800, item["pacote_ip"])
 
-        # Responde à requisição
         if operacao == 1:
             resposta_arp = struct.pack(
                 '!HHBBH6s4s6s4s',
@@ -113,20 +104,16 @@ class TabelaARP:
                 in_if["mac_bytes"], in_if["ip_bytes"],
                 mac_remetente, ip_remetente
             )
-            # Envia unicast para o mac_remetente lido da mensagem ARP
-            quadro_resp = criar_quadro_eth(mac_remetente, in_if["mac_bytes"], 0x0806, resposta_arp)
-            in_if["sock"].send(quadro_resp)
+            enviar_quadro(in_if, mac_remetente, 0x0806, resposta_arp)
 
     def verificar_temporizadores(self, config: dict, callback_falha_arp=None):
         agora = time.time()
 
-        # 1. Expiração do cache (30s)
         expirados = [ip for ip, info in self.cache.items() if agora - info["tempo"] >= 30.0]
         for ip in expirados:
             del self.cache[ip]
             registrar_arp_expirado(ip)
 
-        # 2. Resoluções pendentes (repetições aos 1s, 2s e timeout aos 3s)
         falhas = []
         for ip, pend in list(self.pendentes.items()):
             decorrido = agora - pend["criacao"]
