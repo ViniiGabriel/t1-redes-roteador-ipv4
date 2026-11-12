@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import sys, time, json
+import socket
 
 
 def ler_configuracao(caminho_arquivo):
@@ -30,7 +31,9 @@ def ler_configuracao(caminho_arquivo):
                 interfaces[nome_if] = {
                     'ip': ip_str,
                     'prefixo': int(prefixo_str),
+                    "ip_bytes": socket.inet_aton(ip_str),
                     'mac': mac_str,
+                    "mac_bytes": bytes.fromhex(mac_str.replace(":", "")),
                     'gerencia': (diretiva == 'gerencia')
                 }
 
@@ -50,12 +53,6 @@ def ler_configuracao(caminho_arquivo):
                     'destino': partes[4],
                     'porta': partes[5]
                 })
-    registro_inicio = {
-        "t": round(time.time(), 3),
-        "evento": "inicio",
-        "roteador": nome_roteador
-    }
-    print(json.dumps(registro_inicio), flush=True)
     return {
             'nome': nome_roteador, 
             'interfaces': interfaces,

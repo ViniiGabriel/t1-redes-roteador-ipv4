@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+import sys
+import time
+import json
+import socket
+import struct
+from config import ler_configuracao
+
+BROADCAST_MAC = b'\xff\xff\xff\xff\xff\xff'
+
+def main():
+    if len(sys.argv) < 2:
+        sys.stderr.write("Uso: ./roteador <arquivo_de_configuracao>\n")
+        sys.exit(1)
+
+    config = ler_configuracao(sys.argv[1])
+
+    registro_inicio = {
+        "t": round(time.time(), 3),
+        "evento": "inicio",
+        "roteador": config["nome"]
+    }
+    print(json.dumps(registro_inicio), flush=True)
+
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
+    s.bind(("eth0", 0))
+
+    # Converte o texto "02:00:00:00:01:00" do config para 6 bytes reais
+    meu_mac_str = config["interfaces"]["eth0"]["mac"]
+    meu_mac_bytes = bytes.fromhex(meu_mac_str.replace(":", ""))
+
+    while True:
+        quadro, addr = s.recvfrom(65535)
+
+        # Ignora quadros que o próprio roteador enviou (PACKET_OUTGOING == 4)
+        if addr[2] == 4:
+            continue
+
+        # Regra 1: Quadro menor que 14 bytes é inválido
+        if len(quadro) < 14:
+            continue
+
+        # Separa os 14 bytes do cabeçalho Ethernet: 6B destino, 6B origem, 2B tipo
+        mac_dst, mac_src, ethertype = struct.unpack('!6s6sH', quadro[:14])
+
+        # Regra 2: Só aceita se o destino for o meu MAC ou Broadcast
+        if mac_dst != meu_mac_bytes and mac_dst != BROADCAST_MAC:
+            continue
+
+        sys.stderr.write(
+            f"Quadro aceito! Origem={mac_src.hex(':')} | Destino={mac_dst.hex(':')} | Tipo=0x{ethertype:04x}\n"
+        )
+
+if __name__ == "__main__":
+    main()
