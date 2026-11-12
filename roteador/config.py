@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-import sys, time, json
+import sys
 import socket
+import struct
+
+
+def calcular_broadcast(ip_str, prefixo):
+    ip_int = struct.unpack("!I", socket.inet_aton(ip_str))[0]
+    mask = (0xFFFFFFFF << (32 - prefixo)) & 0xFFFFFFFF if prefixo > 0 else 0
+    bcast_int = (ip_int & mask) | (~mask & 0xFFFFFFFF)
+    return socket.inet_ntoa(struct.pack("!I", bcast_int))
 
 
 def ler_configuracao(caminho_arquivo):
     nome_roteador = None
-    interfaces = {}  # nome_if -> {'ip': str, 'prefixo': int, 'mac': str, 'gerencia': bool}
+    interfaces = {}  # nome_if -> {'nome': str, 'ip': str, ...}
     rotas = []       # lista de dicts: {'prefixo': str, 'via': str}
     filtros = []     # lista de dicts com as regras na ordem do arquivo
-
-    caminho_arquivo = sys.argv[1]
 
     with open(caminho_arquivo, 'r') as f:
         for linha in f:
@@ -26,14 +32,17 @@ def ler_configuracao(caminho_arquivo):
             elif diretiva in ('interface', 'gerencia'):
                 nome_if = partes[1]
                 ip_str, prefixo_str = partes[2].split('/')
-                mac_str = partes[3]
+                prefixo = int(prefixo_str)
+                mac_str = partes[3].lower()
                 
                 interfaces[nome_if] = {
+                    'nome': nome_if,
                     'ip': ip_str,
-                    'prefixo': int(prefixo_str),
-                    "ip_bytes": socket.inet_aton(ip_str),
+                    'prefixo': prefixo,
+                    'ip_bytes': socket.inet_aton(ip_str),
                     'mac': mac_str,
-                    "mac_bytes": bytes.fromhex(mac_str.replace(":", "")),
+                    'mac_bytes': bytes.fromhex(mac_str.replace(":", "")),
+                    'broadcast': calcular_broadcast(ip_str, prefixo),
                     'gerencia': (diretiva == 'gerencia')
                 }
 
@@ -53,10 +62,10 @@ def ler_configuracao(caminho_arquivo):
                     'destino': partes[4],
                     'porta': partes[5]
                 })
+
     return {
-            'nome': nome_roteador, 
-            'interfaces': interfaces,
-            'rotas': rotas,
-            'filtros': filtros
-            }
-   
+        'nome': nome_roteador, 
+        'interfaces': interfaces,
+        'rotas': rotas,
+        'filtros': filtros
+    }
